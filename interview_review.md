@@ -149,16 +149,6 @@ sequenceDiagram
     EC_Skill-->>User: 流式返回执行日志
 ```
 
-**流程说明**
-
-技能（Skill）是 eCan.ai 中 Agent 执行工作的最小单元，本质是一个 **LangGraph 有向状态图**（StateGraph）。
-
-- **创建阶段**：用户在 Flowgram 可视化画布上拖拽节点（LLM 节点、工具节点、条件分支节点等），系统将画布状态序列化为 `diagram JSON`，由 `agent/agent_converter.py` 编译为真正的 LangGraph `StateGraph` 并存入 `EC_Skill.work_flow`。完成后元数据写入 SQLite。
-- **执行阶段**：调用 `EC_Skill.runnable.stream(state)` 启动图执行。每个节点实际上是一个 Python 函数或 MCP 工具调用。LangGraph 按有向边拓扑顺序推进节点，每个节点输出会 merge 回全局 `State` 对象，下一个节点可以读到上游结果。整个执行过程以 **流式（stream）** 方式向上层吐出节点输出，便于实时展示日志。
-- **工具调用**：节点需要调用外部能力（搜索/浏览器/RAG）时，通过 MCP 协议（`agent/mcp/local_client.py` 的 `mcp_call_tool`）转发给对应 MCP 服务器，结果返回后继续图执行。
-
----
-
 ### 4.2 多渠道消息接收与 Agent 路由
 
 ```mermaid
@@ -179,17 +169,6 @@ sequenceDiagram
     EC_Agent-->>ExtChannel: 通过 ChannelPlugin 回复消息
 ```
 
-**流程说明**
-
-这条链路描述的是 Agent 如何响应外部用户（买家/客户）从各渠道发来的消息。
-
-- **消息接入**：每个外部渠道（WhatsApp、Telegram、微信等）对应一个 `ChannelPlugin` 适配器，运行在独立线程中持续监听。收到消息后统一包装成 `ChannelMessage` 对象上报给 `ChannelManager`。`ChannelManager` 负责插件的启动/停止/崩溃重启，不处理业务逻辑。
-- **消息路由**：`ChannelManager` 调用注册的 `on_message` 回调，消息进入 `bridge.py` 的 `dispatch_inbound()`。Bridge 根据消息中的渠道 ID / 用户 ID 找到负责该对话的 `EC_Agent` 实例。
-- **注入 & 恢复**：找到 Agent 后，将消息内容包装成 `human_text` 事件注入到该 Agent 正在等待中的 LangGraph 任务。LangGraph 工作流在等待人工输入的节点（`interrupt` 断点）处被唤醒，`TaskRunner` 读取事件数据写入 state，图从断点处继续向下执行，最终生成回复。
-- **回复发出**：Agent 执行完成后调用 `ChannelPlugin` 的发送接口，把回复推回原渠道。整个过程对 LangGraph 工作流透明——工作流只需在节点里读写 `state.attributes.human.last_message`，无需关心消息来自哪个渠道。
-
----
-
 ### 4.3 定时任务调度执行
 
 ```mermaid
@@ -209,18 +188,6 @@ flowchart LR
     L --> F
 ```
 
-**流程说明**
-
-这条链路描述任务如何从"到时间了"变成"执行完毕"，重点在于 **挂起/恢复** 机制。
-
-- **调度触发**：`Scheduler`（`agent/ec_tasks/scheduler.py`）以轮询方式检查 `ManagedTask.schedule`（支持 cron 表达式和一次性时间点），到点后调用 `TaskRunner.run_task()`。
-- **初始化执行**：`TaskRunner` 加载 Agent 关联的 `EC_Skill`，由 `Executor` 准备初始 LangGraph `State`（包含任务参数、MCP 客户端等），然后开始流式执行图节点。
-- **遇到 interrupt（挂起）**：LangGraph 图中可以用 `interrupt()` 在节点处主动暂停，等待外部事件（如等用户填表、等审批、等浏览器弹窗）。挂起时当前 state 被 checkpoint（序列化存储），任务线程进入阻塞等待。
-- **事件驱动恢复**：外部事件（来自渠道消息、GUI 操作、AppSync 云端推送等）到达后，`resume.build_node_transfer_patch()` 计算需要更新的 state 字段差量（patch），`TaskRunner` 将 patch 注入 LangGraph checkpoint，图从断点处继续执行。
-- **完成**：图走到 `END` 节点后，`TaskRunner` 更新 SQLite 中任务状态为 `completed`，并通过 `TaskProgressBus` 通知 UI 刷新。
-
----
-
 ### 4.4 RAG 知识库查询流程
 
 ```mermaid
@@ -237,17 +204,6 @@ sequenceDiagram
     LightRAGServer-->>LightragClient: 生成回答 + 引用来源
     LightragClient-->>Skill: 返回检索结果
 ```
-
-**流程说明**
-
-RAG（检索增强生成）让 Agent 能基于业务私有数据（产品手册、政策文件、FAQ 等）回答问题，而非单纯依赖 LLM 训练知识。
-
-- **调用方式**：当 LangGraph 工作流的某个节点需要查询知识库时，通过 MCP 工具或直接调用 `LightragClient.query(text, workspace=agent_id)` 发起检索。`workspace` 实现多租户隔离——不同 Agent 可以有各自独立的知识库。
-- **HTTP 代理**：`LightragClient`（`knowledge/lightrag_client.py`）是一个 HTTP 客户端，把查询请求代理给本地运行的 LightRAG 服务进程（默认 `127.0.0.1:9621`）。请求头带 `LIGHTRAG-WORKSPACE` 指定工作空间，LightRAG 服务端据此路由到正确的数据集。
-- **混合检索**：LightRAG 服务内部同时维护**知识图谱**（实体关系）和**向量数据库**，执行 hybrid search——既做向量相似度召回，也做图谱实体遍历，比纯向量方案在结构化知识（如产品属性关系）上召回质量更高。
-- **结果返回**：LightRAG 把检索到的文档片段组织成自然语言回答后返回，`LightragClient` 将结果透传给调用节点，节点把答案写入 state 供后续节点（如 LLM 节点）使用。
-
----
 
 ### 4.5 A2A 跨 Agent 任务委托
 
@@ -268,15 +224,6 @@ sequenceDiagram
     A2AServer-->>A2AClient: 任务结果 / streaming 事件
     A2AClient-->>SupervisorAgent: 汇总返回
 ```
-
-**流程说明**
-
-A2A（Agent-to-Agent）是 eCan.ai 实现多机 Agent 协作的核心机制，让一个 Agent 像调用 API 一样把子任务委托给另一个 Agent。
-
-- **身份标识**：每个 `EC_Agent` 在初始化时持有一张 `AgentCard`（包含 Agent ID、能力描述、支持的 Skill 列表），通过 `A2AStarletteApplication` 暴露 HTTP 服务端点（`/tasks/send`、`/.well-known/agent.json` 等），供其他 Agent 发现和调用。
-- **任务委托**：Supervisor Agent 决定把某个子任务分包出去时，通过自身持有的 `A2AClientWrapper` 向 Worker Agent 的 HTTP 端点发送 A2A 标准格式的 `POST /tasks/send` 请求，请求体包含 skill_id 和输入数据。
-- **Worker 端执行**：Worker Agent 的 `A2AStarletteApplication` 收到请求后，由 `DefaultRequestHandler` 路由给 `A2ATaskExecutor`，后者找到对应 `EC_Skill` 并执行 LangGraph 工作流，执行过程中的中间状态通过 push notification 实时推送给 Supervisor。
-- **结果汇聚**：Supervisor 端的 `A2AClientWrapper` 以 streaming 方式接收 Worker 的更新事件，最终收到完成信号后将结果写回自身的 LangGraph state，继续 Supervisor 自己的工作流。跨机器场景下，只要 Worker 的 HTTP 端点可达（局域网或互联网），整个流程无需改动代码。
 
 ---
 
